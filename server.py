@@ -4,20 +4,21 @@ import pickle
 import random
 import math
 import argparse
+import struct
+import sys
+import os
+import time
+
+# Add current directory to path to ensure imports work
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from game_data import BLOCKS, ITEMS, AIR, DIRT_TILE, STONE_TILE, GRASS_TILE, SAND_TILE, WOOD_TILE, LEAF_TILE
 
 # =====================
 # CONSTANTS
 # =====================
 TILE_SIZE = 40
 CHUNK_SIZE = 16
-
-AIR = 0
-DIRT_TILE = 1
-STONE_TILE = 2
-GRASS_TILE = 3
-SAND_TILE = 4
-WOOD_TILE = 5
-LEAF_TILE = 6
 
 # =====================
 # WORLD GENERATION
@@ -95,13 +96,43 @@ class GameServer:
         self.clients = {}
         self.player_id_counter = 0
         self.lock = threading.Lock()
+        # Optimization: Throttle broadcast frequency
+        self.last_broadcast_time = 0
+        self.broadcast_interval = 0.05  # Broadcast every 50ms instead of every message
+
+    def get_local_ip(self):
+        """Get the local IP address of this machine"""
+        try:
+            # Create a temporary socket to determine the local IP
+            temp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Connect to a public DNS server (doesn't actually send data)
+            temp_socket.connect(("8.8.8.8", 80))
+            local_ip = temp_socket.getsockname()[0]
+            temp_socket.close()
+            return local_ip
+        except:
+            # Fallback to localhost if unable to determine
+            return "127.0.0.1"
 
     def start(self):
         """Start the server"""
         try:
             self.server.bind((self.host, self.port))
             self.server.listen(5)
+            
+            # Display server information
+            print("=" * 50)
+            print("MULTIPLAYER WIZARD GAME - SERVER")
+            print("=" * 50)
             print(f"Server started on {self.host}:{self.port}")
+            
+            # Show the IP address clients should use
+            local_ip = self.get_local_ip()
+            print(f"\n📡 CLIENTS SHOULD CONNECT TO:")
+            print(f"   IPv4 Address: {local_ip}:{self.port}")
+            print(f"\n   Command:")
+            print(f"   python 2dminecraft_multiplayer.py --host {local_ip}")
+            print("=" * 50 + "\n")
             
             while True:
                 client, addr = self.server.accept()
@@ -111,7 +142,20 @@ class GameServer:
                     player_id = self.player_id_counter
                     self.player_id_counter += 1
                 
-                client.sendall(pickle.dumps(player_id))
+                # Send player ID using proper protocol
+                self.send_to_client(client, player_id)
+                
+                # Send block definitions
+                self.send_to_client(client, {
+                    "type": "block_definitions",
+                    "blocks": BLOCKS
+                })
+                
+                # Send item definitions
+                self.send_to_client(client, {
+                    "type": "item_definitions",
+                    "items": ITEMS
+                })
                 
                 client_thread = threading.Thread(
                     target=self.handle_client,
@@ -187,31 +231,51 @@ class GameServer:
             print(f"Client {player_id} disconnected")
 
     def receive_from_client(self, client):
-        """Receive data from a client"""
+        """Receive data from a client with length prefix"""
         try:
+            # Receive 4-byte length prefix
+            length_data = b""
+            while len(length_data) < 4:
+                chunk = client.recv(4 - len(length_data))
+                if not chunk:
+                    return None
+                length_data += chunk
+            
+            message_length = struct.unpack("I", length_data)[0]
+            
+            # Receive exact number of bytes for message
             data = b""
-            while True:
-                chunk = client.recv(4096)
+            while len(data) < message_length:
+                chunk = client.recv(message_length - len(data))
                 if not chunk:
                     return None
                 data += chunk
-                try:
-                    return pickle.loads(data)
-                except:
-                    continue
-        except:
+            
+            return pickle.loads(data)
+        except Exception as e:
+            print(f"Receive error: {e}")
             return None
 
     def send_to_client(self, client, data):
-        """Send data to a client"""
+        """Send data to a client with length prefix"""
         try:
-            client.sendall(pickle.dumps(data))
-        except:
+            serialized = pickle.dumps(data)
+            # Send length prefix (4 bytes) followed by data
+            client.sendall(struct.pack("I", len(serialized)) + serialized)
+        except Exception as e:
+            print(f"Send error: {e}")
             return False
         return True
 
     def broadcast_players(self):
-        """Broadcast all player data to all clients"""
+        """Broadcast all player data to all clients (throttled)"""
+        current_time = time.time()
+        # Only broadcast at intervals to reduce network traffic
+        if current_time - self.last_broadcast_time < self.broadcast_interval:
+            return
+        
+        self.last_broadcast_time = current_time
+        
         with self.lock:
             players_data = {}
             for pid, player_info in self.clients.items():

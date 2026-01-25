@@ -3,9 +3,15 @@ import sys
 import random
 import math
 import argparse
-from network import Network
+import os
 import threading
 import time
+
+# Add current directory to path to ensure imports work
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from network import Network
+from game_data import BLOCKS as DEFAULT_BLOCKS, ITEMS as DEFAULT_ITEMS
 
 # =====================
 # INITIAL SETUP
@@ -26,6 +32,14 @@ FPS = 60
 TILE_SIZE = 40
 CHUNK_SIZE = 16
 
+# =====================
+# GLOBAL GAME DATA (loaded from server)
+# =====================
+BLOCKS = {}  # Will be populated from server
+ITEMS = {}   # Will be populated from server
+BLOCK_ID_TO_NAME = {}  # Reverse lookup: id -> block_name
+
+# Block ID constants (same as in game_data.py)
 AIR = 0
 DIRT_TILE = 1
 STONE_TILE = 2
@@ -35,16 +49,10 @@ WOOD_TILE = 5
 LEAF_TILE = 6
 
 WHITE = (255, 255, 255)
-DIRT_COLOR = (139, 69, 19)
-STONE_COLOR = (110, 110, 110)
-GRASS_COLOR = (34, 139, 34)
-SAND_COLOR = (194, 178, 128)
-WOOD_COLOR = (101, 67, 33)
-LEAF_COLOR = (50, 205, 50)
 PLAYER_COLOR = (0, 0, 255)
 OTHER_PLAYER_COLOR = (255, 0, 0)
 debug = False
-selected_block = DIRT_TILE
+selected_block = 1  # Default to dirt block ID
 
 # =====================
 # WORLD STORAGE
@@ -304,12 +312,36 @@ class Player:
             ),
         )
 
+def get_block_color(block_id):
+    """Get color for a block from definitions"""
+    block_name = BLOCK_ID_TO_NAME.get(block_id)
+    if block_name and block_name in BLOCKS:
+        return tuple(BLOCKS[block_name]["color"])
+    return (128, 128, 128)  # Default gray if not found
+
+def get_block_name(block_id):
+    """Get name for a block from definitions"""
+    block_name = BLOCK_ID_TO_NAME.get(block_id)
+    if block_name and block_name in BLOCKS:
+        return BLOCKS[block_name]["name"]
+    return "Unknown"
+
 def draw_debug(surface, player, cam_x, cam_y, clock):
     mx, my = pygame.mouse.get_pos()
     world_mx = mx + cam_x
     world_my = my + cam_y
     tile_x = world_mx // TILE_SIZE
     tile_y = world_my // TILE_SIZE
+    
+    # Get block at mouse position
+    cx = tile_x // CHUNK_SIZE
+    cy = tile_y // CHUNK_SIZE
+    chunk = get_chunk(cx, cy)
+    lx = tile_x % CHUNK_SIZE
+    ly = tile_y % CHUNK_SIZE
+    block_at_mouse = 0
+    if 0 <= lx < CHUNK_SIZE and 0 <= ly < CHUNK_SIZE:
+        block_at_mouse = chunk[ly][lx]
 
     lines = [
         f"FPS: {int(clock.get_fps())}",
@@ -322,7 +354,18 @@ def draw_debug(surface, player, cam_x, cam_y, clock):
         f"Players Connected: {len(players)}",
         "",
         f"Mouse Tile: {tile_x}, {tile_y}",
+        f"Block at Mouse: {get_block_name(block_at_mouse)} (ID: {block_at_mouse})",
+        f"Selected Block: {get_block_name(selected_block)} (ID: {selected_block})",
+        f"Total Blocks: {len(BLOCKS)}",
     ]
+    
+    # Add multiplayer data
+    if players:
+        lines.append("")
+        lines.append("Connected Players:")
+        for pid, player_data in players.items():
+            if pid != player_id:
+                lines.append(f"  Player {pid}: ({player_data['x']}, {player_data['y']})")
 
     y = 10
     for line in lines:
@@ -349,21 +392,18 @@ def draw_world(surface, cam_x, cam_y):
             ly = ty % CHUNK_SIZE
 
             if 0 <= lx < CHUNK_SIZE and 0 <= ly < CHUNK_SIZE:
-                tile = chunk[ly][lx]
-                if tile == DIRT_TILE:
-                    color = DIRT_COLOR
-                elif tile == STONE_TILE:
-                    color = STONE_COLOR
-                elif tile == GRASS_TILE:
-                    color = GRASS_COLOR
-                elif tile == SAND_TILE:
-                    color = SAND_COLOR
-                elif tile == WOOD_TILE:
-                    color = WOOD_COLOR
-                elif tile == LEAF_TILE:
-                    color = LEAF_COLOR
-                else:
+                tile_id = chunk[ly][lx]
+                
+                # Look up block by ID from the definitions
+                block_name = BLOCK_ID_TO_NAME.get(tile_id)
+                if not block_name or tile_id == 0:  # Skip air blocks
                     continue
+                
+                block_def = BLOCKS.get(block_name)
+                if not block_def:
+                    continue
+                
+                color = tuple(block_def["color"])
 
                 pygame.draw.rect(
                     surface,
@@ -420,7 +460,7 @@ def draw_other_players(surface, cam_x, cam_y, player):
 # MAIN LOOP
 # =====================
 def main(server_host="localhost", server_port=5555):
-    global network, player_id, network_thread, should_exit, world
+    global network, player_id, network_thread, should_exit, world, BLOCKS, ITEMS
     
     # Connect to server
     network = Network()
@@ -431,12 +471,49 @@ def main(server_host="localhost", server_port=5555):
     player_id = network.player_id
     print(f"Connected as Player {player_id}")
     
-    # Start network thread
+    # Keep socket in blocking mode to receive initial game data
+    network.set_blocking_mode()
+    
+    # Receive block definitions from server
+    print("Waiting for block definitions...")
+    block_data = network.receive_blocking()
+    if block_data and block_data.get("type") == "block_definitions":
+        BLOCKS = block_data["blocks"]
+        # Create reverse lookup
+        for block_name, block_data_item in BLOCKS.items():
+            BLOCK_ID_TO_NAME[block_data_item["id"]] = block_name
+        print(f"Loaded {len(BLOCKS)} block definitions")
+    else:
+        print(f"Failed to receive block definitions")
+        return
+    
+    # Receive item definitions from server
+    print("Waiting for item definitions...")
+    item_data = network.receive_blocking()
+    if item_data and item_data.get("type") == "item_definitions":
+        ITEMS = item_data["items"]
+        print(f"Loaded {len(ITEMS)} item definitions")
+    else:
+        print(f"Failed to receive item definitions")
+        return
+    
+    print("Game data loaded successfully")
+    
+    # Switch to non-blocking mode for gameplay
+    network.set_non_blocking_mode()
+    
+    # Start network thread for ongoing updates
     network_thread = threading.Thread(target=network_handler, daemon=True)
     network_thread.start()
     
     player = Player()
     running = True
+    
+    # Optimization: Track last position for network updates (only send when changed)
+    last_player_x = player.rect.x
+    last_player_y = player.rect.y
+    network_update_counter = 0
+    network_update_interval = 5  # Send network updates every 5 frames instead of every frame
 
     while running:
         clock.tick(FPS)
@@ -470,16 +547,23 @@ def main(server_host="localhost", server_port=5555):
         cam_x = player.rect.centerx - WIDTH // 2
         cam_y = player.rect.centery - HEIGHT // 2
 
-        # Send player update to server
-        if network:
-            network.send({
-                "type": "player_update",
-                "x": player.rect.x,
-                "y": player.rect.y,
-                "vel_x": player.vel_x,
-                "vel_y": player.vel_y,
-                "on_ground": player.on_ground
-            })
+        # Optimization: Only send network updates every N frames and when position changed
+        network_update_counter += 1
+        if network_update_counter >= network_update_interval and network:
+            # Only send if position actually changed
+            if (abs(player.rect.x - last_player_x) > 1 or 
+                abs(player.rect.y - last_player_y) > 1):
+                network.send({
+                    "type": "player_update",
+                    "x": player.rect.x,
+                    "y": player.rect.y,
+                    "vel_x": player.vel_x,
+                    "vel_y": player.vel_y,
+                    "on_ground": player.on_ground
+                })
+                last_player_x = player.rect.x
+                last_player_y = player.rect.y
+            network_update_counter = 0
 
         screen.fill(WHITE)
         draw_world(screen, cam_x, cam_y)
@@ -499,7 +583,10 @@ def main(server_host="localhost", server_port=5555):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Multiplayer Wizard Game Client")
-    parser.add_argument("--host", default="localhost", help="Server hostname/IP (default: localhost)")
+    parser.add_argument("--host", default="127.0.0.1", 
+                        help="Server hostname/IP (default: 127.0.0.1)\n"
+                             "For local network: use server's IP address\n"
+                             "Example: python 2dminecraft_multiplayer.py --host 192.168.1.100")
     parser.add_argument("--port", type=int, default=5555, help="Server port (default: 5555)")
     args = parser.parse_args()
     
