@@ -11,7 +11,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from network import Network
-from game_data import BLOCKS as DEFAULT_BLOCKS, ITEMS as DEFAULT_ITEMS
+from game_data import BLOCKS as DEFAULT_BLOCKS, ITEMS as DEFAULT_ITEMS, GAMEVERSION
 
 # =====================
 # INITIAL SETUP
@@ -31,7 +31,6 @@ FPS = 60
 # =====================
 TILE_SIZE = 40
 CHUNK_SIZE = 16
-
 # =====================
 # GLOBAL GAME DATA (loaded from server)
 # =====================
@@ -143,13 +142,33 @@ def place_block(tile_x, tile_y, block_type):
         })
 
 def can_place(player, tile_x, tile_y, max_dist=5):
+    """Check if a block can be placed at this location"""
+    # Check distance
     px = player.rect.centerx // TILE_SIZE
     py = player.rect.centery // TILE_SIZE
 
     dx = tile_x - px
     dy = tile_y - py
 
-    return dx * dx + dy * dy <= max_dist * max_dist
+    if dx * dx + dy * dy > max_dist * max_dist:
+        return False
+    
+    # Create a rect for the block being placed
+    block_rect = pygame.Rect(tile_x * TILE_SIZE, tile_y * TILE_SIZE, TILE_SIZE, TILE_SIZE)
+    
+    # Check collision with current player's body - prevent placing blocks that would intersect
+    if block_rect.colliderect(player.rect):
+        return False
+    
+    # Check collision with other players' bodies
+    for pid, player_data in players.items():
+        if pid == player_id:
+            continue
+        other_player_rect = pygame.Rect(player_data["x"], player_data["y"], 30, 50)
+        if block_rect.colliderect(other_player_rect):
+            return False
+    
+    return True
 
 def get_height(global_x):
     base_height = 8
@@ -222,12 +241,15 @@ def get_chunk(cx, cy):
 # TILE COLLISION HELPERS
 # =====================
 def get_nearby_tiles(rect):
+    """Get all solid tiles near the player for collision detection"""
     tiles = []
 
+    # Check a larger area around the player to catch all potential collisions
+    # Especially important for blocks above (roof collision)
     start_x = rect.left // TILE_SIZE - 1
-    end_x = rect.right // TILE_SIZE + 1
-    start_y = rect.top // TILE_SIZE - 1
-    end_y = rect.bottom // TILE_SIZE + 1
+    end_x = rect.right // TILE_SIZE + 2
+    start_y = rect.top // TILE_SIZE - 2  # Check 2 tiles above for roof collisions
+    end_y = rect.bottom // TILE_SIZE + 2
 
     for ty in range(start_y, end_y):
         for tx in range(start_x, end_x):
@@ -288,17 +310,18 @@ class Player:
     def collide(self, dx, dy):
         for tile in get_nearby_tiles(self.rect):
             if self.rect.colliderect(tile):
-                if dx > 0:
+                if dx > 0:  # Moving right
                     self.rect.right = tile.left
-                if dx < 0:
+                elif dx < 0:  # Moving left
                     self.rect.left = tile.right
-                if dy > 0:
+                elif dy > 0:  # Moving down
                     self.rect.bottom = tile.top
                     self.vel_y = 0
                     self.on_ground = True
-                if dy < 0:
+                elif dy < 0:  # Moving up - STOP IMMEDIATELY
                     self.rect.top = tile.bottom
                     self.vel_y = 0
+                    # Continue checking for more collisions above
 
     def draw(self, surface, cam_x, cam_y, color=PLAYER_COLOR):
         pygame.draw.rect(
@@ -343,6 +366,50 @@ def draw_debug(surface, player, cam_x, cam_y, clock):
     if 0 <= lx < CHUNK_SIZE and 0 <= ly < CHUNK_SIZE:
         block_at_mouse = chunk[ly][lx]
 
+    # Calculate current biome
+    try:
+        import math
+        def hash_function_local(x):
+            """True random hash without sine"""
+            x = int(x)
+            x = (x ^ 61) ^ (x >> 13)
+            x = x * 2654435769
+            x = x ^ (x >> 16)
+            return (x & 0x7fffffff) / 2147483647.0
+        
+        def linear_interpolate_local(t):
+            """Linear interpolation"""
+            return t
+        
+        def value_noise_local(x, scale=1.0):
+            """Generate value noise with less smoothing"""
+            x_scaled = x / scale
+            xi = math.floor(x_scaled)
+            xf = x_scaled - xi
+            
+            n0 = hash_function_local(xi)
+            n1 = hash_function_local(xi + 1)
+            
+            u = linear_interpolate_local(xf)
+            return n0 * (1 - u) + n1 * u
+        
+        player_world_x = player.rect.centerx // TILE_SIZE
+        biome_noise = value_noise_local(player_world_x, 300) * 100
+        biome_noise += value_noise_local(player_world_x + 5000, 150) * 50
+        
+        if biome_noise > 110:
+            current_biome = "Desert"
+        elif biome_noise > 70:
+            current_biome = "Plains"
+        elif biome_noise > 30:
+            current_biome = "Forest"
+        elif biome_noise > -10:
+            current_biome = "Mountain"
+        else:
+            current_biome = "Ice Plains"
+    except:
+        current_biome = "Unknown"
+    
     lines = [
         f"FPS: {int(clock.get_fps())}",
         f"Player ID: {player_id}",
@@ -352,6 +419,7 @@ def draw_debug(surface, player, cam_x, cam_y, clock):
         f"Chunk Y: {player.rect.centery // (TILE_SIZE * CHUNK_SIZE)}",
         f"Loaded Chunks: {len(world)}",
         f"Players Connected: {len(players)}",
+        f"Biome: {current_biome}",
         "",
         f"Mouse Tile: {tile_x}, {tile_y}",
         f"Block at Mouse: {get_block_name(block_at_mouse)} (ID: {block_at_mouse})",
@@ -471,8 +539,29 @@ def main(server_host="localhost", server_port=5555):
     player_id = network.player_id
     print(f"Connected as Player {player_id}")
     
-    # Keep socket in blocking mode to receive initial game data
+    # Keep socket in blocking mode for initial setup
     network.set_blocking_mode()
+    
+    # Send version check
+    print(f"Sending version check (v{GAMEVERSION})...")
+    network.send({"type": "version_check", "version": GAMEVERSION})
+    
+    # Receive server response (either rejection or OK)
+    version_response = network.receive_blocking()
+    if not version_response:
+        print("Failed to receive version check response from server")
+        return
+    
+    if version_response.get("type") == "connection_rejected":
+        reason = version_response.get("reason", "Unknown reason")
+        print(f"Connection rejected: {reason}")
+        network.socket.close()
+        return
+    
+    # Version check passed, now receive game data
+    if version_response.get("type") != "version_check_ok":
+        print(f"Unexpected response from server: {version_response}")
+        return
     
     # Receive block definitions from server
     print("Waiting for block definitions...")
