@@ -121,6 +121,13 @@ Loaded chunk count
 Mouse screen, world, and tile coordinates
 
 ---
+##how to install
+first run:
+```bash
+git clone https://github.com/Augersclass1/2dwizardgamemultiplayer.git
+```
+
+---
 
 #🚧 Known Limitations
 
@@ -147,4 +154,5 @@ Biomes
 Sound effects and music
 
 ---
+
 
