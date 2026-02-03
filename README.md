@@ -62,9 +62,11 @@ Install pygame with:
 #▶️ How to Run
 
 ### Single Player (Local)
+thiss is currently depreciated and wont be updated anymore its recomended that you dont use this as it has many glitches
 ```bash
 python 2dminecraft.py
 ```
+
 
 ### Multiplayer
 
@@ -145,3 +147,4 @@ Biomes
 Sound effects and music
 
 ---
+
